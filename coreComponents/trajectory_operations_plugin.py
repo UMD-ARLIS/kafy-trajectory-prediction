@@ -118,10 +118,12 @@ class TrajectoryOperationsPlugin:
         # I already validated this script file in my add_operation command flow
         dest_path = os.path.join(self.operations_dir, f"{op_name}.py")
 
-        # Copy implementation file into transformers/
-        with open(script_path, "r") as src:
-            with open(dest_path, "w") as dst:
-                dst.write(src.read())
+        # Copy operation script into operations/
+        # (skip if it is already there: opening dest for writing would truncate it)
+        if os.path.abspath(script_path) != os.path.abspath(dest_path):
+            with open(script_path, "r") as src:
+                with open(dest_path, "w") as dst:
+                    dst.write(src.read())
                 
         if op_name not in registry:
             # Create new operation entry

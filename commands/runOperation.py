@@ -1,105 +1,95 @@
-
-from coreComponents.spatial_constraints_plugin import SpatialConstraintsPlugin
-from coreComponents.detokenization import *
-
-
-
-
-# commands/addOperation.py
+# commands/runOperation.py
 
 import os
-import pandas as pd
-import torch
 import pickle
+import importlib.util
+import logging
+
+import h3
+import torch
 
 from coreComponents.transformers_plugin import TransformersPlugin
-# from coreComponents.tokenization import (
-#     TrajectoryTokenizer,
-#     tokenize_dataset,
-# )
+from coreComponents.tokenization import TrajectoryTokenizer
 from coreComponents.trajectory_operations_plugin import TrajectoryOperationsPlugin
 from coreComponents.partitioning import PartitioningModule
-import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def run_operation(path:str, operation_name: str, partitioning_input_path: str, trajplug_input: dict):
+def run_operation(path: str, operation_name: str, partitioning_input_path: str, trajplug_input: dict):
     """
     Executes an operation on input trajectories.
 
     Args:
         operation_name (str): Name of the registered operation.
         partitioning_input_path (str): Path to the trajectories input file.
-        trajplug_input (dict): Additional parameters for the operation logic.
+        trajplug_input (dict): Additional parameters passed to the operation script.
 
     Returns:
-        list: List of results per trajectory.
+        list: One result per trajectory. Spatial results are lists of (lat, lon).
     """
-    # Call the partitioning Module 
+    # ----------------------------------------------------------
+    # 1. Select the model for the region covering the input trajectories
+    # ----------------------------------------------------------
     PT = PartitioningModule(project_path=path)
-    SC = SpatialConstraintsPlugin()
-    TP = TrajectoryOperationsPlugin(path)
-    
-    # Get model path and trajectories
-    model_path, trajectories = PT.select_model(operation_name, partitioning_input_path)  
+    model_path, trajectories = PT.select_model(operation_name, partitioning_input_path)
+    logger.info(f"Selected model: {model_path}")
 
-    
-    print(f"Selected model: {model_path}")
-    
-    # Load the model
-    model_data = torch.load(model_path, map_location=torch.device('cpu'))
-    
-    # Check if there's separate metadata file
+    # ----------------------------------------------------------
+    # 2. Load tokenizer + transformer name from the model metadata
+    # ----------------------------------------------------------
     model_dir = os.path.dirname(model_path)
-    model_name = os.path.basename(model_path).replace('.pkl', '').replace('.pt', '')
+    model_name = os.path.basename(model_path).replace('.pt', '')
     metadata_path = os.path.join(model_dir, f"{model_name}_metadata.pkl")
-    
-    if os.path.exists(metadata_path):
-        with open(metadata_path, 'rb') as f:
-            metadata = pickle.load(f)
-        tokenizer = metadata.get("tokenizer")
-        transformer_name = metadata.get("transformer")
-    else:
-        # Fallback to model data
-        transformer_tokenizer = model_data.get("tokenizer")
-        transformer_name = model_data.get("transformer")
-    
-    print(tokenizer.get_vocab_size())
-    # print(tokenizer.)
-    print(tokenizer.resolution)
-    tokenizer_ = TrajectoryTokenizer(resolution=tokenizer.resolution)
-    print("I finished this scucessfully")
-    # Load operation logic and spatial constraints
-    # logic_path = OM.get_path(operation_name)
-    # logic = SC.load_functions_from_file(logic_path)
-    
-    # # Load spatial rules (if needed)
-    # rules = OM.get_rules(operation_name)
-    # rules_logic = SC.load_rules(rules) if rules else None
-    # print(f"Loaded rules for this operation: {rules}")
-    
-    # Tokenizer (use the one from the model if available)
-    # if tokenizer is None:
-    #     tokenizer = TrajectoryTokenizer(resolution=8)
-    
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Model metadata not found: {metadata_path}")
+
+    with open(metadata_path, 'rb') as f:
+        metadata = pickle.load(f)
+    tokenizer = metadata["tokenizer"]
+    transformer_name = metadata["transformer"]
+
+    # ----------------------------------------------------------
+    # 3. Rebuild the model and load the trained weights
+    # ----------------------------------------------------------
+    build_model_fn = TransformersPlugin(path).load_model_builder(transformer_name)
+    model = build_model_fn(tokenizer)
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    model.eval()
+
+    # ----------------------------------------------------------
+    # 4. Load the operation logic (function named after the operation)
+    # ----------------------------------------------------------
+    operation_data = TrajectoryOperationsPlugin(path).get(operation_name)
+    if operation_data is None:
+        raise ValueError(f"Operation '{operation_name}' is not registered.")
+    spec = importlib.util.spec_from_file_location(operation_name, operation_data["script"])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    logic = getattr(module, operation_name)
+
+    # ----------------------------------------------------------
+    # 5. Tokenize -> run operation -> detokenize, per trajectory
+    # ----------------------------------------------------------
     final_results = []
     for traj in trajectories:
-        tokenized_traj = tokenizer.tokenize(traj, resolution=9)
-        print(f"Tokenized trajectory: {tokenized_traj}")
-        
-    #     # Pass the loaded model to the logic function
-    #     result = logic(model=model_data, tokenized_traj=tokenized_traj, 
-    #                   rules_logic=rules_logic, **trajplug_input)
-    #     print(f"Result: {result}")
-        
-    #     # If result is spatial, decode tokens to points
-    #     if tokenizer.is_spatial(result):  # TODO: is is the best way to implement this function?
-    #         continue
-    #         # decoded_result = Detokenization.decode(result)
-    #         # final_results.append(decoded_result)
-    #     else:
-    #         final_results.append(result)
+        gps_string = ",".join(f"{p.y} {p.x}" for p in traj)
+        h3_string = TrajectoryTokenizer.gps_string_to_h3(gps_string, tokenizer.resolution)
+        input_ids = torch.tensor([tokenizer.encode(h3_string)])
 
-    # return final_results
+        with torch.no_grad():
+            result = logic(model, input_ids, **trajplug_input)
+
+        if torch.is_tensor(result):
+            result = result[0].tolist()
+
+        if tokenizer.is_spatial(result):
+            # Drop special tokens (pad, decoder start, eos, ...) and map cells back to GPS
+            tokens = [t for t in tokenizer.decode(result).split() if h3.is_valid_cell(t)]
+            result = TrajectoryTokenizer.h3_to_gps(" ".join(tokens))
+
+        logger.info(f"Result: {result}")
+        final_results.append(result)
+
+    return final_results

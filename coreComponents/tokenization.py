@@ -218,7 +218,7 @@ class TrajectoryTokenizer:
             return False
         
         # Check if it's a list of H3 tokens (strings)
-        if all(isinstance(token, str) and h3.h3_is_valid(token) for token in result):
+        if all(isinstance(token, str) and h3.is_valid_cell(token) for token in result):
             return True
         
         # Check if it's a list of integer IDs

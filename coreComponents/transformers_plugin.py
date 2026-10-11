@@ -81,9 +81,11 @@ class TransformersPlugin:
         dest_path = os.path.join(self.transformers_dir, f"{name}.py")
 
         # Copy implementation file into transformers/
-        with open(implementation_path, "r") as src:
-            with open(dest_path, "w") as dst:
-                dst.write(src.read())
+        # (skip if it is already there: opening dest for writing would truncate it)
+        if os.path.abspath(implementation_path) != os.path.abspath(dest_path):
+            with open(implementation_path, "r") as src:
+                with open(dest_path, "w") as dst:
+                    dst.write(src.read())
 
         # Register
         registry[name] = dest_path

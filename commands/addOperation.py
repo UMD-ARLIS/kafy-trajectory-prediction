@@ -299,7 +299,11 @@ def prepare_next_point_dataset(df, tokenizer):
         })
     
     logger.info(f"Prepared {len(data)} samples for next point prediction")
-    return data
+    ds = Dataset.from_list(data)
+    return DatasetDict({
+        "train": ds,
+        "validation": ds,
+    })
 
 
 def create_data_collator(tokenizer, operation_type, max_length=256):
