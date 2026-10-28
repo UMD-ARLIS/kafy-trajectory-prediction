@@ -1,0 +1,10 @@
+# python -m pip install -r requirements.txt
+torch
+transformers
+accelerate
+datasets
+pandas
+shapely
+h3>=4.0
+prompt_toolkit
+Pillow>=9.1
